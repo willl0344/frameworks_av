@@ -104,15 +104,10 @@ public:
     FLAC__uint64 getTotalSamples() const {
         return mStreamInfo.total_samples;
     }
-    void set24BitOutput(bool enabled) {
-        m24BitOutput = enabled;
-    }
 
     // media buffers
     void allocateBuffers();
     void releaseBuffers();
-    void copyBuffer(short *dst, const int *const *src, unsigned nSamples);
-
     MediaBuffer *readBuffer() {
         return readBuffer(false, 0LL);
     }
@@ -129,11 +124,12 @@ private:
     sp<MetaData> mTrackMetadata;
     bool mInitCheck;
 
-    bool m24BitOutput;
+    bool mEnable24Bit;
 
     // media buffers
     size_t mMaxBufferSize;
     MediaBufferGroup *mGroup;
+    void (*mCopy)(short *dst, const int *const *src, unsigned nSamples, unsigned nChannels);
 
     // handle to underlying libFLAC parser
     FLAC__StreamDecoder *mDecoder;
@@ -388,43 +384,51 @@ void FLACParser::errorCallback(FLAC__StreamDecoderErrorStatus status)
     mErrorStatus = status;
 }
 
-void FLACParser::copyBuffer(short *dst, const int *const *src, unsigned nSamples)
+// Copy samples from FLAC native 32-bit non-interleaved to 16-bit interleaved.
+// These are candidates for optimization if needed.
+static void copyMultiCh8(short *dst, const int *const *src, unsigned nSamples, unsigned nChannels)
 {
-    unsigned int nChannels = getChannels();
-    unsigned int nBits = getBitsPerSample();
-    switch (nBits) {
-        case 8:
-            for (unsigned i = 0; i < nSamples; ++i) {
-                for (unsigned c = 0; c < nChannels; ++c) {
-                    *dst++ = src[c][i] << 8;
-                }
-            }
-            break;
-        case 16:
-            for (unsigned i = 0; i < nSamples; ++i) {
-                for (unsigned c = 0; c < nChannels; ++c) {
-                    *dst++ = src[c][i];
-                }
-            }
-            break;
-        case 24:
-            if (m24BitOutput) {
-                for (unsigned i = 0; i < nSamples; ++i) {
-                    for (unsigned c = 0; c < nChannels; ++c) {
-                        *dst++ = (short)(src[c][i] & 255);
-                        *dst++ = (short)(src[c][i] >> 8);
-                    }
-                }
-            } else {
-                // truncate to 16 bit
-                for (unsigned i = 0; i < nSamples; ++i) {
-                    for (unsigned c = 0; c < nChannels; ++c) {
-                        *dst++ = src[c][i] >> 8;
-                    }
-                }
-            }
-            break;
+    for (unsigned i = 0; i < nSamples; ++i) {
+        for (unsigned c = 0; c < nChannels; ++c) {
+            *dst++ = src[c][i] << 8;
+        }
     }
+}
+
+static void copyMultiCh16(short *dst, const int *const *src, unsigned nSamples, unsigned nChannels)
+{
+    for (unsigned i = 0; i < nSamples; ++i) {
+        for (unsigned c = 0; c < nChannels; ++c) {
+            *dst++ = src[c][i];
+        }
+    }
+}
+
+// 24-bit versions should do dithering or noise-shaping, here or in AudioFlinger
+
+static void copyMultiCh24(short *dst, const int *const *src, unsigned nSamples, unsigned nChannels)
+{
+    for (unsigned i = 0; i < nSamples; ++i) {
+        for (unsigned c = 0; c < nChannels; ++c) {
+            *dst++ = src[c][i] >> 8;
+        }
+    }
+}
+
+static void copyMultiCh24Pack32(short *dst, const int *const *src, unsigned nSamples, unsigned nChannels)
+{
+    for (unsigned i = 0; i < nSamples; ++i) {
+        for (unsigned c = 0; c < nChannels; ++c) {
+            *dst++ = (short)(src[c][i] & 255);
+            *dst++ = (short)(src[c][i] >> 8);
+        }
+    }
+}
+
+
+static void copyTrespass(short *dst, const int *const *src, unsigned nSamples, unsigned nChannels)
+{
+    TRESPASS();
 }
 
 // FLACParser
@@ -437,9 +441,10 @@ FLACParser::FLACParser(
       mFileMetadata(fileMetadata),
       mTrackMetadata(trackMetadata),
       mInitCheck(false),
-      m24BitOutput(false),
+      mEnable24Bit(false),
       mMaxBufferSize(0),
       mGroup(NULL),
+      mCopy(copyTrespass),
       mDecoder(NULL),
       mCurrentPos(0LL),
       mEOF(false),
@@ -449,6 +454,10 @@ FLACParser::FLACParser(
       mWriteBuffer(NULL),
       mErrorStatus((FLAC__StreamDecoderErrorStatus) -1)
 {
+    char value[PROPERTY_VALUE_MAX] = {0};
+    property_get("audio.offload.24bit.enable", value, "0");
+    mEnable24Bit = atoi(value);
+
     ALOGV("FLACParser::FLACParser");
 
     memset(&mStreamInfo, 0, sizeof(mStreamInfo));
@@ -540,6 +549,22 @@ status_t FLACParser::init()
             ALOGE("unsupported sample rate %u", getSampleRate());
             return NO_INIT;
         }
+        // configure the appropriate copy function, defaulting to trespass
+        static const struct {
+            unsigned mBitsPerSample;
+            void (*mCopy)(short *dst, const int *const *src, unsigned nSamples, unsigned nChannels);
+        } table[] = {
+            { 8,  copyMultiCh8  },
+            { 16, copyMultiCh16 },
+            { 24, (mEnable24Bit ? copyMultiCh24Pack32 : copyMultiCh24) },
+            { 24, copyMultiCh24 },
+        };
+        for (unsigned i = 0; i < sizeof(table)/sizeof(table[0]); ++i) {
+            if (table[i].mBitsPerSample == getBitsPerSample()) {
+                mCopy = table[i].mCopy;
+                break;
+            }
+        }
         // populate track metadata
         if (mTrackMetadata != 0) {
             mTrackMetadata->setCString(kKeyMIMEType, MEDIA_MIMETYPE_AUDIO_RAW);
@@ -566,8 +591,8 @@ void FLACParser::allocateBuffers()
 {
     CHECK(mGroup == NULL);
     mGroup = new MediaBufferGroup;
-    // allocate enough to hold 24-bits (packed in 32 bits)
-    mMaxBufferSize = getMaxBlockSize() * getChannels() * 4;
+    mMaxBufferSize = getMaxBlockSize() * getChannels() *
+        ((mEnable24Bit && getBitsPerSample() == 24) ? 4 : 2);
     mGroup->add_buffer(new MediaBuffer(mMaxBufferSize));
 }
 
@@ -576,7 +601,6 @@ void FLACParser::releaseBuffers()
     CHECK(mGroup != NULL);
     delete mGroup;
     mGroup = NULL;
-
 }
 
 MediaBuffer *FLACParser::readBuffer(bool doSeek, FLAC__uint64 sample)
@@ -619,13 +643,13 @@ MediaBuffer *FLACParser::readBuffer(bool doSeek, FLAC__uint64 sample)
         return NULL;
     }
     size_t bufferSize = blocksize * getChannels() *
-        (((getBitsPerSample() == 24) && m24BitOutput) ? 4 : 2);
+        (mEnable24Bit && (getBitsPerSample() == 24) ? 4 : 2);
     CHECK(bufferSize <= mMaxBufferSize);
 
     short *data = (short *) buffer->data();
     buffer->set_range(0, bufferSize);
     // copy PCM from FLAC write buffer to our media buffer, with interleaving
-    copyBuffer(data, mWriteBuffer, blocksize);
+    (*mCopy)(data, mWriteBuffer, blocksize, getChannels());
     // fill in buffer metadata
     CHECK(mWriteHeader.number_type == FLAC__FRAME_NUMBER_TYPE_SAMPLE_NUMBER);
     FLAC__uint64 sampleNumber = mWriteHeader.number.sample_number;
@@ -663,13 +687,6 @@ status_t FLACSource::start(MetaData *params)
     ALOGV("FLACSource::start");
 
     CHECK(!mStarted);
-#ifdef ENABLE_AV_ENHANCEMENTS
-    if (mTrackMetadata != 0) {
-        int32_t bitwidth = 16;
-        mTrackMetadata->findInt32(kKeySampleBits, &bitwidth);
-        mParser->set24BitOutput(bitwidth == 24);
-    }
-#endif
     mParser->allocateBuffers();
     mStarted = true;
 
@@ -683,6 +700,7 @@ status_t FLACSource::stop()
     CHECK(mStarted);
     mParser->releaseBuffers();
     mStarted = false;
+
     return OK;
 }
 

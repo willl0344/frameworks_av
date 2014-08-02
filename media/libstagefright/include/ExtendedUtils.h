@@ -167,8 +167,6 @@ struct ExtendedUtils {
 
     //helper function to parse rtp port range form system property
     static void parseRtpPortRangeFromSystemProperty(unsigned *start, unsigned *end);
-
-    static void updateOutputBitWidth(sp<MetaData> format, bool isOffload);
 };
 
 class VSyncLocker : public RefBase {
