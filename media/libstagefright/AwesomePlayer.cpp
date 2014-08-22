@@ -1932,8 +1932,6 @@ status_t AwesomePlayer::initAudioDecoder() {
 
     int64_t durationUs = -1;
     mAudioTrack->getFormat()->findInt64(kKeyDuration, &durationUs);
-    int32_t bitsPerSample = 16;
-    mAudioTrack->getFormat()->findInt32(kKeySampleBits, &bitsPerSample);
 
     if (!mOffloadAudio && mAudioSource != NULL) {
         ALOGI("Could not offload audio decode, try pcm offload");
@@ -1941,7 +1939,6 @@ status_t AwesomePlayer::initAudioDecoder() {
         if (durationUs >= 0) {
             format->setInt64(kKeyDuration, durationUs);
         }
-        format->setInt32(kKeySampleBits, bitsPerSample);
         mOffloadAudio = canOffloadStream(format, (mVideoSource != NULL), vMeta,
                                     (isStreamingHTTP() || isWidevineContent()),
                                      streamType);
