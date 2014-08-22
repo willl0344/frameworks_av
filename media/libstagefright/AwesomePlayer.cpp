@@ -1080,6 +1080,9 @@ status_t AwesomePlayer::play_l() {
             }
 
             if (err != OK) {
+                mAudioSource.clear();
+                mOmxSource.clear();
+
                 delete mAudioPlayer;
                 mAudioPlayer = NULL;
 
@@ -1153,20 +1156,17 @@ status_t AwesomePlayer::fallbackToSWDecoder() {
     if (!(mFlags & AUDIOPLAYER_STARTED)) {
         mAudioSource->stop();
     }
-    modifyFlags((AUDIO_RUNNING | AUDIOPLAYER_STARTED), CLEAR);
-    mOffloadAudio = false;
 #ifdef ENABLE_AV_ENHANCEMENTS
     // no 24-bit for fallback
     ExtendedUtils::updateOutputBitWidth(mAudioSource->getFormat(), false);
 #endif
+    mAudioSource.clear();
+    modifyFlags((AUDIO_RUNNING | AUDIOPLAYER_STARTED), CLEAR);
+    mOffloadAudio = false;
 
     mAudioSource = mOmxSource;
     if (mAudioSource != NULL) {
-        err = mAudioSource->start();
-
-        if (err != OK) {
-            mAudioSource.clear();
-        } else {
+        if ((err = mAudioSource->start()) == OK) {
             mSeekNotificationSent = true;
             if (mExtractorFlags & MediaExtractor::CAN_SEEK) {
                 seekTo_l(curTimeUs);
@@ -1932,6 +1932,8 @@ status_t AwesomePlayer::initAudioDecoder() {
 
     int64_t durationUs = -1;
     mAudioTrack->getFormat()->findInt64(kKeyDuration, &durationUs);
+    int32_t bitsPerSample = 16;
+    mAudioTrack->getFormat()->findInt32(kKeySampleBits, &bitsPerSample);
 
     if (!mOffloadAudio && mAudioSource != NULL) {
         ALOGI("Could not offload audio decode, try pcm offload");
@@ -1939,6 +1941,7 @@ status_t AwesomePlayer::initAudioDecoder() {
         if (durationUs >= 0) {
             format->setInt64(kKeyDuration, durationUs);
         }
+        format->setInt32(kKeySampleBits, bitsPerSample);
         mOffloadAudio = canOffloadStream(format, (mVideoSource != NULL), vMeta,
                                     (isStreamingHTTP() || isWidevineContent()),
                                      streamType);
@@ -2336,6 +2339,9 @@ void AwesomePlayer::onVideoEvent() {
         if (err != OK) {
             ALOGE("Failed to fallback to SW decoder err = %d", err);
             notifyListener_l(MEDIA_ERROR, MEDIA_ERROR_UNKNOWN, err);
+
+            mAudioSource.clear();
+            mOmxSource.clear();
 
             delete mAudioPlayer;
             mAudioPlayer = NULL;
@@ -3423,8 +3429,20 @@ bool AwesomePlayer::isWidevineContent() const {
 
 status_t AwesomePlayer::dump(int fd, const Vector<String16> &args) const {
     Mutex::Autolock autoLock(mStatsLock);
+    int dfd = dup(fd);
 
-    FILE *out = fdopen(dup(fd), "w");
+    if (dfd < 0) {
+        ALOGE("dump: failed to dup file descriptor");
+        return -errno;
+    }
+
+    FILE *out = fdopen(dfd, "w");
+
+    if (!out) {
+        ALOGE("dump: failed to open file");
+        close(dfd);
+        return -ENOMEM;
+    }
 
     fprintf(out, " AwesomePlayer\n");
     if (mStats.mFd < 0) {
@@ -3527,7 +3545,6 @@ void AwesomePlayer::onAudioTearDownEvent() {
 
     // stream info is cleared by reset_l() so copy what we need
     mAudioTearDownWasPlaying = (mFlags & PLAYING);
-    uint32_t loopingFlags = (mFlags & (LOOPING | AUTO_LOOPING));
     KeyedVector<String8, String8> uriHeaders(mUriHeaders);
     sp<DataSource> fileSource(mFileSource);
 
@@ -3556,8 +3573,6 @@ void AwesomePlayer::onAudioTearDownEvent() {
         // a MEDIA_ERROR to the client and abort the prepare
         mFlags |= PREPARE_CANCELLED;
     }
-
-    mFlags |= loopingFlags;
 
     mAudioTearDown = true;
     mIsAsyncPrepare = true;
